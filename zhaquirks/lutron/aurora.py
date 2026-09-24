@@ -1,25 +1,30 @@
-"""Direct Aurora Z3-1BRL notifications for firmware using the Philips protocol.
+"""Lutron Aurora Z3-1BRL button and rotary notifications (firmware 0x00000c12).
 
-Firmware 0x00000c12 sends Philips-style command 0 notifications on 0xFC00
-with manufacturer code 0x100B. Each notification becomes one immediate
-``aurora_notification`` event. Button event codes and dial phases remain
-numeric; click grouping and rotation speed classification belong to consumers.
+Every Philips-style 0xFC00 notification is preserved as ``aurora_notification``.
+Known reports additionally produce immediate normalized input events. Native
+press/hold/release reports are not delayed or grouped into multi-clicks.
 
-The captured payloads begin with a three-byte prefix, followed by numeric
-ZCL type/value pairs. The first byte identifies the control (1 for the button,
-0x14 for the dial). The other prefix bytes are preserved without interpretation.
-The first enum8 is exposed as ``event_code``; for the dial, the following int16
-is also exposed as ``rotation``, with positive clockwise and negative
-counterclockwise values in the capture. Physical units are not established.
+Rotary payload fields are [phase, A, B, C, D, E, F]. Captures identify C as a
+signed cumulative movement counter. Fresh windows have phase 1 and 4*A == 7*C;
+other reports continue the counter, including phase-1 direction changes and
+D timer rollovers. This reset signature is empirical, not a published firmware
+contract. A/E are adjusted amounts and are never exposed as physical deltas.
 
-Every parsed value retains its payload offset and type. Subsequent int16/uint16
-fields have not been assigned time/position semantics. Unknown types and
-incomplete values leave an ``undecoded_hex`` tail. Full payload and ZCL frame
-hex are always retained, including for short or otherwise unknown notifications.
+``rotation`` carries a signed delta in degrees (clockwise positive), using the
+Hue API's nominal resolution of 1000 counts per revolution. The device phase
+is preserved separately. Counter differences use signed 16-bit arithmetic,
+assuming less than half the counter range of movement between reports.
 
-PhilipsRemoteCluster knows the notification prefix but also synthesizes and
-delays button events. This handler uses the same cluster/command identifiers
-without inheriting that gesture behavior or discarding the extended payload.
+Unknown layouts remain raw. Startup mid-window and detectable sequence gaps
+produce ``rotation_unavailable`` instead of a fabricated amount. The observed
+7-bit sequence wrap is accepted alongside the standard 8-bit wrap. Other
+sequence discontinuities establish a new baseline. A lost whole sequence
+cycle is not detectable. State belongs to this cluster and resets on reload.
+
+The prefix is a uint16 control ID and a uint8 control type. Numeric fields keep
+their offsets/types, and undecoded tails and complete frame bytes are retained.
+Shared Philips cluster identifiers do not imply shared gesture processing or
+that this empirical Aurora counter decoder applies to other Philips remotes.
 """
 
 from typing import Any
@@ -30,7 +35,20 @@ from zigpy.zcl.foundation import BaseCommandDefs, ZCLCommandDef
 
 from zhaquirks.builder import QuirkBuilder
 from zhaquirks.clusters import CustomCluster
-from zhaquirks.const import ZHA_SEND_EVENT
+from zhaquirks.const import (
+    ARGS,
+    BUTTON,
+    COMMAND,
+    LEFT,
+    LONG_PRESS,
+    LONG_RELEASE,
+    PRESSED,
+    RIGHT,
+    ROTARY_KNOB,
+    ROTATED,
+    SHORT_RELEASE,
+    ZHA_SEND_EVENT,
+)
 from zhaquirks.philips import PhilipsRemoteCluster
 
 PHILIPS_MANUFACTURER_CODE = 0x100B
@@ -42,12 +60,19 @@ NUMERIC_TYPES = {
 }
 
 
-class AuroraRawCluster(CustomCluster):
-    """Forward each manufacturer notification without gesture synthesis."""
+class AuroraCluster(CustomCluster):
+    """Preserve native notifications and normalize supported input reports."""
 
     cluster_id = PhilipsRemoteCluster.cluster_id
-    ep_attribute = "aurora_raw"
+    ep_attribute = "aurora"
     name = "Aurora notifications"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Track the button phase and rotary baseline per device."""
+        super().__init__(*args, **kwargs)
+        self._holding = False
+        self._rotation_count: int | None = None
+        self._last_notification: tuple[int, bytes] | None = None
 
     class ClientCommandDefs(BaseCommandDefs):
         """Keep the whole notification, including extensions and unknown fields."""
@@ -83,8 +108,10 @@ class AuroraRawCluster(CustomCluster):
             "command_id": hdr.command_id,
             "sequence": hdr.tsn,
         }
+        if len(payload) >= 2:
+            event["control_id"] = int.from_bytes(payload[:2], "little")
         if len(payload) >= 3:
-            event["control_id"] = payload[0]
+            event["control_type"] = payload[2]
             event["prefix_hex"] = payload[:3].hex()
             fields = []
             offset = 3
@@ -104,14 +131,130 @@ class AuroraRawCluster(CustomCluster):
                 event["undecoded_hex"] = payload[offset:].hex()
             if fields and fields[0]["type"] == foundation.DataTypeId.enum8:
                 event["event_code"] = fields[0]["value"]
-                if (
-                    payload[0] == DIAL_CONTROL_ID
-                    and len(fields) > 1
-                    and fields[1]["type"] == foundation.DataTypeId.int16
-                ):
-                    event["rotation"] = fields[1]["value"]
 
         self.listener_event(ZHA_SEND_EVENT, "aurora_notification", event)
+        notification = (int(hdr.tsn), payload)
+        if notification == self._last_notification:
+            return
+        discontinuity = False
+        if self._last_notification is not None:
+            previous_sequence = self._last_notification[0]
+            expected = (previous_sequence + 1) % 256
+            discontinuity = hdr.tsn != expected and not (
+                previous_sequence == 127 and hdr.tsn == 0
+            )
+            if discontinuity:
+                self._holding = False
+                self._rotation_count = None
+        self._last_notification = notification
+        if len(payload) < 3:
+            self._holding = False
+            self._rotation_count = None
+        self._normalize_button(payload, hdr.tsn)
+        self._normalize_rotation(payload, event, discontinuity=discontinuity)
+
+    def _normalize_rotation(
+        self, payload: bytes, event: dict[str, Any], *, discontinuity: bool = False
+    ) -> None:
+        """Translate cumulative rotary counts to signed relative angles."""
+        if event.get("control_id") != DIAL_CONTROL_ID:
+            return
+        fields = event.get("fields", [])
+        if (
+            len(payload) != 23
+            or payload[:3] != bytes.fromhex("140001")
+            or [f["type"] for f in fields] != [0x30, 0x29, 0x21, 0x29, 0x21, 0x29, 0x21]
+        ):
+            self._rotation_count = None
+            self._rotation_unavailable(event["sequence"], "unsupported_payload")
+            return
+        code, adjusted, _, count, _, duplicate, period = (f["value"] for f in fields)
+        if code not in (1, 2) or adjusted != duplicate or period != 400:
+            self._rotation_count = None
+            self._rotation_unavailable(event["sequence"], "unsupported_payload")
+            return
+        previous = self._rotation_count
+        self._rotation_count = count
+        if discontinuity:
+            self._rotation_unavailable(event["sequence"], "sequence_gap")
+            return
+        reset = code == 1 and 4 * adjusted == 7 * count
+        if reset:
+            delta = count
+        elif previous is not None:
+            delta = (count - previous + 32768) % 65536 - 32768
+        else:
+            self._rotation_unavailable(event["sequence"], "missing_baseline")
+            return
+        if delta == -32768:
+            self._rotation_unavailable(event["sequence"], "ambiguous_counter_wrap")
+            return
+        self.listener_event(
+            ZHA_SEND_EVENT,
+            "rotation",
+            {
+                "control_id": DIAL_CONTROL_ID,
+                "sequence": event["sequence"],
+                "phase": "start" if code == 1 else "repeat",
+                "delta_counts": delta,
+                "delta_degrees": delta * 360 / 1000,
+                "direction": ("clockwise" if delta > 0 else "counterclockwise")
+                if delta
+                else None,
+            },
+        )
+
+    def _rotation_unavailable(self, sequence: int, reason: str) -> None:
+        """Report an undecodable interval without substituting zero movement."""
+        self.listener_event(
+            ZHA_SEND_EVENT,
+            "rotation_unavailable",
+            {"control_id": DIAL_CONTROL_ID, "sequence": sequence, "reason": reason},
+        )
+
+    def _normalize_button(self, payload: bytes, sequence: int) -> None:
+        """Translate native button phases and decisecond durations."""
+        if (
+            len(payload) != 8
+            or payload[:4] != bytes.fromhex("01000030")
+            or payload[5] != foundation.DataTypeId.uint16
+        ):
+            return
+        code = payload[4]
+        if code == 1:
+            command = "hold" if self._holding else "long_press_start"
+            self._holding = True
+        else:
+            self._holding = False
+            command = {0: "press_start", 2: "press_end", 3: "long_press_end"}.get(code)
+        if command is not None:
+            self.listener_event(
+                ZHA_SEND_EVENT,
+                command,
+                {
+                    "control_id": 1,
+                    "sequence": sequence,
+                    "duration_seconds": int.from_bytes(payload[6:8], "little") / 10,
+                },
+            )
 
 
-(QuirkBuilder("Lutron", "Z3-1BRL").replaces(AuroraRawCluster).add_to_registry())
+(
+    QuirkBuilder("Lutron", "Z3-1BRL")
+    .replaces(AuroraCluster)
+    .device_automation_triggers(
+        {
+            (PRESSED, BUTTON): {COMMAND: "press_start"},
+            (LONG_PRESS, BUTTON): {COMMAND: "long_press_start"},
+            (SHORT_RELEASE, BUTTON): {COMMAND: "press_end"},
+            (LONG_RELEASE, BUTTON): {COMMAND: "long_press_end"},
+            (ROTATED, ROTARY_KNOB): {COMMAND: "rotation"},
+            (ROTATED, RIGHT): {COMMAND: "rotation", ARGS: {"direction": "clockwise"}},
+            (ROTATED, LEFT): {
+                COMMAND: "rotation",
+                ARGS: {"direction": "counterclockwise"},
+            },
+        }
+    )
+    .add_to_registry()
+)
