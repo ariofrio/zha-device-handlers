@@ -36,14 +36,11 @@ from zigpy.zcl.foundation import BaseCommandDefs, ZCLCommandDef
 from zhaquirks.builder import QuirkBuilder
 from zhaquirks.clusters import CustomCluster
 from zhaquirks.const import (
-    ARGS,
     BUTTON,
     COMMAND,
-    LEFT,
     LONG_PRESS,
     LONG_RELEASE,
     PRESSED,
-    RIGHT,
     ROTARY_KNOB,
     ROTATED,
     SHORT_RELEASE,
@@ -249,11 +246,6 @@ class AuroraCluster(CustomCluster):
             (SHORT_RELEASE, BUTTON): {COMMAND: "press_end"},
             (LONG_RELEASE, BUTTON): {COMMAND: "long_press_end"},
             (ROTATED, ROTARY_KNOB): {COMMAND: "rotation"},
-            (ROTATED, RIGHT): {COMMAND: "rotation", ARGS: {"direction": "clockwise"}},
-            (ROTATED, LEFT): {
-                COMMAND: "rotation",
-                ARGS: {"direction": "counterclockwise"},
-            },
         }
     )
     .add_to_registry()

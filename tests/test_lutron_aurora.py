@@ -18,7 +18,7 @@ from zigpy.zcl.clusters.general import (
 )
 from zigpy.zcl.clusters.lightlink import LightLink
 
-from zhaquirks.const import LEFT, RIGHT, ROTATED
+from zhaquirks.const import ROTARY_KNOB, ROTATED
 from zhaquirks.lutron.aurora import AuroraCluster
 
 PRESS = bytes.fromhex("1d0b1012000100003000210000")
@@ -274,13 +274,15 @@ def test_control_id_uses_both_bytes(aurora):
     assert listener.normalized_events == []
 
 
-@pytest.mark.parametrize(("frame", "subtype"), [(CW, RIGHT), (CCW, LEFT)])
-def test_direction_trigger_matches_forwarded_zha_event(aurora, frame, subtype):
-    """Direction presets match the event envelope Home Assistant receives."""
+@pytest.mark.parametrize("frame", [CW, CCW])
+def test_single_rotation_trigger_matches_both_directions(aurora, frame):
+    """One rotation trigger receives signed movement in either direction."""
     cluster, listener = aurora
     endpoint = Endpoint.new(cluster.endpoint, listener)
     feed(cluster, frame)
-    trigger = cluster.endpoint.device.device_automation_triggers[(ROTATED, subtype)]
+    triggers = cluster.endpoint.device.device_automation_triggers
+    assert {key for key in triggers if key[0] == ROTATED} == {(ROTATED, ROTARY_KNOB)}
+    trigger = triggers[(ROTATED, ROTARY_KNOB)]
     event = listener.zha_events[-1]
     for key, value in trigger.items():
         if isinstance(value, dict):
