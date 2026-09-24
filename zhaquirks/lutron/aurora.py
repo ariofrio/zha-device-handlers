@@ -27,13 +27,18 @@ Shared Philips cluster identifiers do not imply shared gesture processing or
 that this empirical Aurora counter decoder applies to other Philips remotes.
 """
 
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, ClassVar
 
+from zha.application.platforms import BaseEntity
+from zha.application.platforms.event import BaseEvent
+from zha.application.platforms.event.const import ButtonEventType, EventDeviceClass
 import zigpy.types as t
 from zigpy.zcl import foundation
 from zigpy.zcl.foundation import BaseCommandDefs, ZCLCommandDef
 
 from zhaquirks.builder import QuirkBuilder
+from zhaquirks.builder.device import QuirkV2Device
 from zhaquirks.clusters import CustomCluster
 from zhaquirks.const import (
     BUTTON,
@@ -236,9 +241,74 @@ class AuroraCluster(CustomCluster):
             )
 
 
+class AuroraEvent(BaseEvent):
+    """Expose a single Aurora control through ZHA's native event platform."""
+
+    _control_id: int
+
+    def on_add(self) -> None:
+        """Listen directly to the quirk cluster, before HA event-bus forwarding."""
+        super().on_add()
+        self._cluster.add_listener(self)
+        self._on_remove_callbacks.append(lambda: self._cluster.remove_listener(self))
+
+    def zha_send_event(self, command: str, args: Any) -> None:
+        """Forward normalized input without decoding or gesture inference."""
+        if (
+            command in self.event_types
+            and isinstance(args, dict)
+            and args.get("control_id") == self._control_id
+        ):
+            self._trigger_event(command, dict(args))
+
+
+class AuroraButton(AuroraEvent):
+    """Aurora's push button."""
+
+    _control_id = 1
+    _unique_id_suffix = "button"
+    _attr_translation_key = "aurora_button"
+    _attr_fallback_name = "Button"
+    _attr_device_class = EventDeviceClass.BUTTON
+    _attr_event_types: ClassVar[list[str]] = [
+        ButtonEventType.PRESS_START,
+        ButtonEventType.LONG_PRESS_START,
+        "hold",
+        ButtonEventType.PRESS_END,
+        ButtonEventType.LONG_PRESS_END,
+    ]
+
+
+class AuroraDial(AuroraEvent):
+    """Aurora's infinite rotary dial."""
+
+    _control_id = 0x14
+    _unique_id_suffix = "dial"
+    _attr_translation_key = "aurora_dial"
+    _attr_fallback_name = "Dial"
+    _attr_event_types: ClassVar[list[str]] = ["rotation", "rotation_unavailable"]
+
+
+class AuroraDevice(QuirkV2Device):
+    """Discover the Aurora's input controls alongside its standard entities."""
+
+    def discover_entities(self) -> Iterator[BaseEntity]:
+        """Expose the normalized button and dial through ZHA's event platform."""
+        yield from super().discover_entities()
+        endpoint = self.endpoints.get(1)
+        if endpoint is None:
+            return
+        cluster = endpoint.zigpy_endpoint.in_clusters.get(AuroraCluster.cluster_id)
+        if not isinstance(cluster, AuroraCluster):
+            return
+        for entity_class in (AuroraButton, AuroraDial):
+            yield entity_class(endpoint=endpoint, device=self, cluster=cluster)
+
+
 (
     QuirkBuilder("Lutron", "Z3-1BRL")
     .replaces(AuroraCluster)
+    .zha_device_class(AuroraDevice)
     .device_automation_triggers(
         {
             (PRESSED, BUTTON): {COMMAND: "press_start"},

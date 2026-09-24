@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 
 import pytest
+from zha.application import Platform
+from zha.application.gateway import Gateway
+from zha.application.helpers import CoordinatorConfiguration, ZHAConfiguration, ZHAData
 from zha.zigbee.endpoint import Endpoint
 from zigpy.zcl import ClusterType
 from zigpy.zcl.clusters.general import (
@@ -513,3 +516,137 @@ def test_unrelated_cluster_commands_do_not_emit_notifications(aurora, header):
     cluster, listener = aurora
     feed(cluster, bytes.fromhex(header) + PRESS[5:])
     assert listener.events == []
+
+
+async def test_quirk_discovers_button_and_dial_event_entities(aurora):
+    """A resolved quirk discovers input entities without any HA-specific code."""
+    cluster, _ = aurora
+    gateway = Gateway(
+        ZHAData(
+            config=ZHAConfiguration(
+                coordinator_configuration=CoordinatorConfiguration(path="/dev/fake")
+            )
+        )
+    )
+    gateway.application_controller = cluster.endpoint.device.application
+    device = gateway.get_or_create_device(cluster.endpoint.device)
+    entities = list(device.discover_entities())
+    events = [e for e in entities if e.PLATFORM == Platform.EVENT]
+    assert {e.fallback_name for e in events} == {"Button", "Dial"}
+    button = next(e for e in events if e.fallback_name == "Button")
+    dial = next(e for e in events if e.fallback_name == "Dial")
+    assert button.device_class == "button"
+    assert button.event_types == [
+        "press_start",
+        "long_press_start",
+        "hold",
+        "press_end",
+        "long_press_end",
+    ]
+    assert dial.event_types == ["rotation", "rotation_unavailable"]
+    assert len({e.unique_id for e in events}) == len(events)
+    assert any(e.PLATFORM == Platform.SENSOR for e in entities)
+
+
+@pytest.fixture
+async def input_entities(aurora):
+    """Discover and attach the quirk's input entities through the ZHA gateway."""
+    cluster, _ = aurora
+    gateway = Gateway(
+        ZHAData(
+            config=ZHAConfiguration(
+                coordinator_configuration=CoordinatorConfiguration(path="/dev/fake")
+            )
+        )
+    )
+    gateway.application_controller = cluster.endpoint.device.application
+    device = gateway.get_or_create_device(cluster.endpoint.device)
+    entities = {
+        e.fallback_name: e
+        for e in device.discover_entities()
+        if e.PLATFORM == Platform.EVENT
+    }
+    for entity in entities.values():
+        entity.on_add()
+    yield entities
+    for entity in entities.values():
+        await entity.on_remove()
+
+
+def test_button_entity_delivers_native_phases_and_repeated_holds(
+    aurora, input_entities
+):
+    """Button events keep immediate phases and durations while the dial is idle."""
+    cluster, _ = aurora
+    button_events = []
+    dial_events = []
+    input_entities["Button"].on_event("event_triggered", button_events.append)
+    input_entities["Dial"].on_event("event_triggered", dial_events.append)
+    for frame in [
+        "1d0b1039000100003000210000",
+        "1d0b103a000100003001210c00",
+        "1d0b103b000100003001211400",
+        "1d0b103c000100003001211c00",
+        "1d0b103d000100003003211d00",
+        "1d0b103e000100003000210000",
+        "1d0b103f000100003002210200",
+    ]:
+        feed(cluster, bytes.fromhex(frame))
+    assert [
+        (e.triggered.event_type, e.triggered.event_attributes["duration_seconds"])
+        for e in button_events
+    ] == [
+        ("press_start", 0),
+        ("long_press_start", 1.2),
+        ("hold", 2.0),
+        ("hold", 2.8),
+        ("long_press_end", 2.9),
+        ("press_start", 0),
+        ("press_end", 0.2),
+    ]
+    assert not dial_events
+
+
+def test_dial_entity_delivers_signed_movement_and_unavailable_reports(
+    aurora, input_entities
+):
+    """Dial events preserve amounts and omit amounts when a report is lost."""
+    cluster, _ = aurora
+    events = []
+    button_events = []
+    input_entities["Dial"].on_event("event_triggered", events.append)
+    input_entities["Button"].on_event("event_triggered", button_events.append)
+    for seq, frame in [(1, CW), (2, CW), (3, CCW), (5, CW)]:
+        feed(cluster, frame[:3] + bytes([seq]) + frame[4:])
+    assert [e.triggered.event_type for e in events] == [
+        "rotation",
+        "rotation",
+        "rotation",
+        "rotation_unavailable",
+    ]
+    assert [e.triggered.event_attributes["delta_degrees"] for e in events[:3]] == [
+        11.52,
+        11.52,
+        -5.76,
+    ]
+    assert events[-1].triggered.event_attributes == {
+        "control_id": 20,
+        "sequence": 5,
+        "reason": "sequence_gap",
+    }
+    assert not button_events
+
+
+async def test_removed_input_entity_stops_listening(aurora, input_entities):
+    """Removing and re-adding an entity must not leak or duplicate listeners."""
+    cluster, _ = aurora
+    button = input_entities["Button"]
+    events = []
+    button.on_event("event_triggered", events.append)
+    await button.on_remove()
+    feed(cluster, PRESS)
+    assert not events
+    button.on_add()
+    feed(cluster, RELEASE)
+    assert len(events) == 1
+    assert events[0].triggered.event_type == "press_end"
